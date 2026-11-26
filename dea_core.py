@@ -1,37 +1,73 @@
-"""Independent implementation of the formulations in proposals 1 and 2.
+"""Optimize staged input reductions for an input-oriented CCR DEA model."""
 
-No existing evaluator is imported or modified. Data are read without rewriting.
-Finite vertex enumeration is intended for the supplied 2/3 input, one-output cases.
-"""
 from __future__ import annotations
-import itertools
+
+from dataclasses import dataclass
+from itertools import combinations, islice, product
+
+import clarabel
 import numpy as np
-from scipy.optimize import linprog, minimize, nnls
-from scipy.linalg import block_diag
+from numpy.typing import NDArray
 from scipy import sparse
+from scipy.linalg import block_diag
+from scipy.optimize import linprog, minimize, nnls
 
-EPS = 1e-6
-TOL = 2e-7
+FloatArray = NDArray[np.float64]
+
+VERTEX_BATCH_SIZE = 4_000
+VERTEX_DETERMINANT_TOLERANCE = 1e-11
+VERTEX_FEASIBILITY_TOLERANCE = 1e-8
+VERTEX_ZERO_TOLERANCE = 1e-10
+VERTEX_ROUNDING_DIGITS = 9
+
+MIN_INPUT_FRACTION = 1e-6
+CONSTRAINT_TOLERANCE = 2e-7
+ACTIVE_CONSTRAINT_TOLERANCE = 1e-6
+PRUNING_TOLERANCE = 1e-10
+SLSQP_OBJECTIVE_TOLERANCE = 1e-12
+SLSQP_GAP_TOLERANCE = 2e-8
+VERIFIED_GAP_TOLERANCE = 2e-7
+SLSQP_MAX_ITERATIONS = 700
+NNLS_MAX_ITERATIONS = 5_000
+CLARABEL_TOLERANCE = 1e-11
+CLARABEL_MAX_ITERATIONS = 300
+LP_INFEASIBLE_STATUS = 2
 
 
-def vertices(A):
-    n, d = A.shape
-    C = np.vstack([A, np.eye(d)])
-    b = np.r_[np.ones(n), np.zeros(d)]
-    found = {}
-    combs = iter(itertools.combinations(range(n + d), d))
-    while batch := list(itertools.islice(combs, 4000)):
-        ix = np.asarray(batch)
-        M = C[ix]
-        ok = np.abs(np.linalg.det(M)) > 1e-11
-        if not ok.any():
+@dataclass(frozen=True)
+class QuadraticSolution:
+    """Store a feasible reduction vector and a dual lower bound on its objective."""
+
+    reductions: FloatArray
+    objective: float
+    lower_bound: float
+
+
+def enumerate_dual_vertices(input_per_output: FloatArray) -> FloatArray:
+    """Enumerate vertices of the CCR dual polyhedron for one positive output."""
+    producer_count, input_count = input_per_output.shape
+    coefficients = np.vstack([input_per_output, np.eye(input_count)])
+    limits = np.r_[np.ones(producer_count), np.zeros(input_count)]
+    row_combinations = combinations(range(len(limits)), input_count)
+    vertices = {}
+
+    while batch := list(islice(row_combinations, VERTEX_BATCH_SIZE)):
+        rows = np.asarray(batch)
+        active_systems = coefficients[rows]
+        nonsingular = np.abs(np.linalg.det(active_systems)) > VERTEX_DETERMINANT_TOLERANCE
+        if not nonsingular.any():
             continue
-        P = np.linalg.solve(M[ok], b[ix[ok]][..., None])[..., 0]
-        good = np.min(C @ P.T - b[:, None], axis=0) >= -1e-8
-        for p in P[good]:
-            p[np.abs(p) < 1e-10] = 0
-            found[tuple(np.round(p, 9))] = p
-    return np.array([found[k] for k in sorted(found)])
+
+        rhs = limits[rows[nonsingular]][..., None]
+        candidates = np.linalg.solve(active_systems[nonsingular], rhs)[..., 0]
+        slack = coefficients @ candidates.T - limits[:, None]
+        feasible = np.min(slack, axis=0) >= -VERTEX_FEASIBILITY_TOLERANCE
+        for vertex in candidates[feasible]:
+            vertex[np.abs(vertex) < VERTEX_ZERO_TOLERANCE] = 0
+            key = tuple(np.round(vertex, VERTEX_ROUNDING_DIGITS))
+            vertices[key] = vertex
+
+    return np.array([vertices[key] for key in sorted(vertices)])
 
 
 def efficiency_primal(X, Y, x, y):
@@ -53,148 +89,230 @@ def efficiency_primal(X, Y, x, y):
     return float(sol.fun)
 
 
-def quadratic(W, G, b, initial=None, force_clarabel=False):
-    """min x'Wx s.t. Gx<=b, with a feasible dual lower bound."""
-    dim = len(W)
-    if initial is None or np.max(G @ initial - b) > TOL:
-        lp = linprog(np.zeros(dim), A_ub=G, b_ub=b,
-                     bounds=[(None, None)] * dim, method='highs')
-        if lp.status == 2:
+def dual_objective_lower_bound(
+    weights: FloatArray,
+    constraint_matrix: FloatArray,
+    constraint_limits: FloatArray,
+    multipliers: FloatArray,
+) -> float:
+    """Evaluate the Lagrangian dual at nonnegative inequality multipliers."""
+    nonnegative_multipliers = np.maximum(multipliers, 0)
+    linear_term = constraint_matrix.T @ nonnegative_multipliers
+    minimum_lagrangian = -0.25 * linear_term @ np.linalg.solve(weights, linear_term)
+    return float(minimum_lagrangian - constraint_limits @ nonnegative_multipliers)
+
+
+def solve_with_clarabel(
+    weights: FloatArray, constraint_matrix: FloatArray, constraint_limits: FloatArray
+) -> tuple[FloatArray, FloatArray]:
+    """Solve the same inequalities with a conic solver and return its dual variables."""
+    settings = clarabel.DefaultSettings()
+    settings.verbose = False
+    settings.tol_gap_abs = CLARABEL_TOLERANCE
+    settings.tol_gap_rel = CLARABEL_TOLERANCE
+    settings.tol_feas = CLARABEL_TOLERANCE
+    settings.max_iter = CLARABEL_MAX_ITERATIONS
+    solver = clarabel.DefaultSolver(
+        sparse.csc_matrix(np.triu(2 * weights)),
+        np.zeros(len(weights)),
+        sparse.csc_matrix(constraint_matrix),
+        constraint_limits,
+        [clarabel.NonnegativeConeT(len(constraint_limits))],
+        settings,
+    )
+    solution = solver.solve()
+    if str(solution.status) not in ("Solved", "AlmostSolved"):
+        raise RuntimeError(f"Clarabel failed ({solution.status}).")
+    return np.asarray(solution.x), np.asarray(solution.z)
+
+
+def solve_convex_qp(
+    weights: FloatArray,
+    constraint_matrix: FloatArray,
+    constraint_limits: FloatArray,
+    initial: FloatArray,
+) -> QuadraticSolution | None:
+    """Minimize r.T @ weights @ r under linear inequalities.
+
+    Return None for an infeasible branch and retry with Clarabel when the
+    SLSQP solution lacks a sufficiently tight numerical lower bound.
+    """
+    if np.max(constraint_matrix @ initial - constraint_limits) > CONSTRAINT_TOLERANCE:
+        feasibility = linprog(
+            np.zeros(len(weights)),
+            A_ub=constraint_matrix,
+            b_ub=constraint_limits,
+            bounds=(None, None),
+            method="highs",
+        )
+        if feasibility.status == LP_INFEASIBLE_STATUS:
             return None
-        if not lp.success:
-            raise RuntimeError(lp.message)
-        initial = lp.x
-    result = minimize(lambda x: x @ W @ x, initial,
-                      jac=lambda x: 2 * W @ x, method='SLSQP',
-                      constraints={'type': 'ineq', 'fun': lambda x: b - G @ x,
-                                   'jac': lambda x: -G},
-                      options={'ftol': 1e-12, 'maxiter': 700})
-    x = result.x
-    active = b - G @ x < 1e-6
-    lam = np.zeros(len(b))
-    if active.any():
-        try:
-            lam[active] = nnls(G[active].T, -2 * W @ x, maxiter=5000)[0]
-        except RuntimeError:
-            pass
-    def lower_bound(lam):
-        lam = np.maximum(lam, 0)
-        v = G.T @ lam
-        return float(-0.25 * v @ np.linalg.solve(W, v) - b @ lam)
-    lb = lower_bound(lam)
-    gap = float(x @ W @ x - lb)
-    if (force_clarabel or not result.success or np.max(G @ x - b) > TOL
-            or gap > 2e-8 * max(1., x @ W @ x)):
-        import clarabel
-        settings = clarabel.DefaultSettings()
-        settings.verbose = False
-        settings.tol_gap_abs = 1e-11
-        settings.tol_gap_rel = 1e-11
-        settings.tol_feas = 1e-11
-        settings.max_iter = 300
-        solver = clarabel.DefaultSolver(sparse.csc_matrix(np.triu(2 * W)),
-                    np.zeros(dim), sparse.csc_matrix(G), b,
-                    [clarabel.NonnegativeConeT(len(b))], settings)
-        sol = solver.solve()
-        if str(sol.status) not in ('Solved', 'AlmostSolved'):
-            raise RuntimeError(f'Clarabel failed: {sol.status}')
-        x = np.array(sol.x)
-        lb = lower_bound(np.array(sol.z))
-    primal = float(x @ W @ x)
-    residual = float(max(0., np.max(G @ x - b)))
-    if residual > TOL or primal - lb > 2e-7 * max(1., primal):
-        raise RuntimeError(f'QP verification failed: residual={residual}, gap={primal-lb}')
-    return {'x': x, 'fun': primal, 'lb': lb, 'residual': residual,
-            'gap': max(0., primal - lb)}
+        if not feasibility.success:
+            raise RuntimeError(f"Feasibility LP failed ({feasibility.message}).")
+        initial = feasibility.x
+
+    candidate = minimize(
+        lambda reductions: reductions @ weights @ reductions,
+        initial,
+        jac=lambda reductions: 2 * weights @ reductions,
+        method="SLSQP",
+        constraints={
+            "type": "ineq",
+            "fun": lambda reductions: constraint_limits - constraint_matrix @ reductions,
+            "jac": lambda reductions: -constraint_matrix,
+        },
+        options={"ftol": SLSQP_OBJECTIVE_TOLERANCE, "maxiter": SLSQP_MAX_ITERATIONS},
+    )
+    reductions = candidate.x
+    slack = constraint_limits - constraint_matrix @ reductions
+    fallback_reason = f"SLSQP status ({candidate.message})"
+    if candidate.success:
+        fallback_reason = "SLSQP constraint residual exceeded tolerance"
+        if np.min(slack) >= -CONSTRAINT_TOLERANCE:
+            multipliers = np.zeros(len(constraint_limits))
+            active = slack < ACTIVE_CONSTRAINT_TOLERANCE
+            try:
+                if active.any():
+                    multipliers[active], _ = nnls(
+                        constraint_matrix[active].T,
+                        -2 * weights @ reductions,
+                        maxiter=NNLS_MAX_ITERATIONS,
+                    )
+            except RuntimeError as error:
+                fallback_reason = f"Unable to estimate SLSQP dual multipliers ({error})"
+            else:
+                objective = float(reductions @ weights @ reductions)
+                lower_bound = dual_objective_lower_bound(
+                    weights, constraint_matrix, constraint_limits, multipliers
+                )
+                gap = abs(objective - lower_bound)
+                if gap <= SLSQP_GAP_TOLERANCE * max(1.0, objective):
+                    return QuadraticSolution(reductions, objective, lower_bound)
+                fallback_reason = f"SLSQP dual gap exceeded tolerance ({gap:.3g})"
+
+    try:
+        reductions, multipliers = solve_with_clarabel(weights, constraint_matrix, constraint_limits)
+    except RuntimeError as error:
+        raise RuntimeError(f"{fallback_reason}. {error}") from error
+    objective = float(reductions @ weights @ reductions)
+    lower_bound = dual_objective_lower_bound(
+        weights, constraint_matrix, constraint_limits, multipliers
+    )
+    residual = float(np.max(constraint_matrix @ reductions - constraint_limits))
+    gap = abs(objective - lower_bound)
+    if (
+        not np.isfinite([objective, lower_bound, residual]).all()
+        or residual > CONSTRAINT_TOLERANCE
+        or gap > VERIFIED_GAP_TOLERANCE * max(1.0, objective)
+    ):
+        raise RuntimeError(
+            f"{fallback_reason}. Clarabel verification failed "
+            f"(residual={residual:.3g}, dual gap={gap:.3g})."
+        )
+    return QuadraticSolution(reductions, objective, lower_bound)
 
 
-def constraints(B, tau, h):
-    d = B.shape[1]
-    return (np.vstack([B, -B[h:h+1], -np.eye(d), np.eye(d)]),
-            np.r_[B.sum(axis=1) - 1., 1./tau - B[h].sum(),
-                  np.zeros(d), np.full(d, 1. - EPS)])
+def build_stage_constraints(
+    weighted_vertices: FloatArray, target: float, branch_index: int
+) -> tuple[FloatArray, FloatArray]:
+    """Build the stage inequalities when the selected vertex enforces the target."""
+    input_count = weighted_vertices.shape[1]
+    vertex_totals = weighted_vertices.sum(axis=1)
+    constraint_matrix = np.vstack(
+        [
+            weighted_vertices,
+            -weighted_vertices[branch_index : branch_index + 1],
+            -np.eye(input_count),
+            np.eye(input_count),
+        ]
+    )
+    constraint_limits = np.r_[
+        vertex_totals - 1.0,
+        1.0 / target - vertex_totals[branch_index],
+        np.zeros(input_count),
+        np.full(input_count, 1.0 - MIN_INPUT_FRACTION),
+    ]
+    return constraint_matrix, constraint_limits
 
 
-def single(B, tau, W=None, force_clarabel=False):
-    W = np.eye(B.shape[1]) if W is None else W
-    initial = np.full(B.shape[1], 1. - 1. / (B.sum(axis=1).min() * tau))
-    solutions = []
-    for h in range(len(B)):
-        G, b = constraints(B, tau, h)
-        q = quadratic(W, G, b, initial, force_clarabel)
-        if q is not None:
-            q['h'] = h
-        solutions.append(q)
-    good = [s for s in solutions if s is not None]
-    if not good:
-        raise RuntimeError('No feasible branch')
-    best = min(good, key=lambda s: s['fun']).copy()
-    best['global_lb'] = min(s['lb'] for s in good)
-    return best, solutions
+def radial_path(initial_efficiency: float, targets: FloatArray, input_count: int) -> FloatArray:
+    """Reduce all inputs at the same rate at each efficiency target."""
+    rates = 1.0 - initial_efficiency / targets
+    return np.repeat(rates[:, None], input_count, axis=1)
 
 
-def joint(B, taus, independent, branch_solutions, common=False):
-    T, d, H = len(taus), B.shape[1], len(B)
-    e0 = 1. / B.sum(axis=1).min()
-    radial = np.array([np.full(d, 1 - e0/t) for t in taus])
-    best = {'x': radial.ravel(), 'fun': float(np.sum(radial**2)),
-            'gap': 0., 'residual': 0., 'h': None}
-    mono = np.zeros(((T-1)*d, T*d))
-    for t in range(T-1):
-        mono[t*d:(t+1)*d, t*d:(t+1)*d] = np.eye(d)
-        mono[t*d:(t+1)*d, (t+1)*d:(t+2)*d] = -np.eye(d)
-    combos = ([tuple([h]*T) for h in range(H)] if common
-              else itertools.product(range(H), repeat=T))
-    ranked = []
-    for hs in combos:
-        ss = [branch_solutions[t][h] for t, h in enumerate(hs)]
-        if any(s is None for s in ss):
+def solve_single_stage(
+    weighted_vertices: FloatArray, target: float
+) -> tuple[FloatArray, list[QuadraticSolution | None]]:
+    """Return the best reduction for one target and the solution for each vertex branch."""
+    initial_efficiency = 1.0 / weighted_vertices.sum(axis=1).min()
+    input_count = weighted_vertices.shape[1]
+    start = np.full(input_count, 1.0 - initial_efficiency / target)
+    weights = np.eye(input_count)
+    branches = []
+    for branch_index in range(len(weighted_vertices)):
+        matrix, limits = build_stage_constraints(weighted_vertices, target, branch_index)
+        branches.append(solve_convex_qp(weights, matrix, limits, start))
+
+    feasible = [solution for solution in branches if solution is not None]
+    if not feasible:
+        raise RuntimeError(f"No feasible improvement branch for target {target:.6f}.")
+    best = min(feasible, key=lambda solution: solution.objective)
+    return best.reductions, branches
+
+
+def solve_monotone_path(
+    weighted_vertices: FloatArray,
+    targets: FloatArray,
+    stage_branches: list[list[QuadraticSolution | None]],
+) -> FloatArray:
+    """Solve all stages with nondecreasing reductions by pruning vertex combinations."""
+    stage_count = len(targets)
+    vertex_count, input_count = weighted_vertices.shape
+    variable_count = stage_count * input_count
+    initial_efficiency = 1.0 / weighted_vertices.sum(axis=1).min()
+    best_path = radial_path(initial_efficiency, targets, input_count)
+    best_objective = float(np.square(best_path).sum())
+
+    monotone_constraints = np.zeros(((stage_count - 1) * input_count, variable_count))
+    identity = np.eye(input_count)
+    for stage in range(stage_count - 1):
+        current = slice(stage * input_count, (stage + 1) * input_count)
+        following = slice((stage + 1) * input_count, (stage + 2) * input_count)
+        monotone_constraints[current, current] = identity
+        monotone_constraints[current, following] = -identity
+
+    ranked: list[tuple[float, tuple[int, ...]]] = []
+    for vertex_indices in product(range(vertex_count), repeat=stage_count):
+        branch_solutions = [stage_branches[t][index] for t, index in enumerate(vertex_indices)]
+        if any(solution is None for solution in branch_solutions):
             continue
-        ranked.append((sum(s['lb'] for s in ss), hs))
+        feasible = [solution for solution in branch_solutions if solution is not None]
+        lower_bound = sum(solution.lower_bound for solution in feasible)
+        ranked.append((lower_bound, vertex_indices))
     ranked.sort()
-    solved, certs = 0, []
-    for lb, hs in ranked:
-        if lb >= best['fun'] - 1e-10:
-            certs.append(lb)
-            break  # all remaining certified lower bounds are at least this large
-        cons = [constraints(B, tau, h) for tau,h in zip(taus,hs)]
-        G = np.vstack([block_diag(*[c[0] for c in cons]), mono])
-        b = np.r_[np.concatenate([c[1] for c in cons]), np.zeros((T-1)*d)]
-        initial = np.concatenate([branch_solutions[t][h]['x'] for t,h in enumerate(hs)])
-        sol = quadratic(np.eye(T*d), G, b, initial)
-        solved += 1
-        if sol is None:
-            continue
-        certs.append(sol['lb'])
-        if sol['fun'] < best['fun']:
-            best = dict(sol, h=hs)
-    best['global_lb'] = min(certs) if certs else best['fun']
-    best['global_gap'] = max(0., best['fun'] - best['global_lb'])
-    best['solved_qps'] = solved
-    best['x'] = best['x'].reshape(T,d)
-    return best
 
+    weights = np.eye(variable_count)
+    monotone_limits = np.zeros(len(monotone_constraints))
+    for lower_bound, vertex_indices in ranked:
+        if lower_bound >= best_objective - PRUNING_TOLERANCE:
+            break
 
-def grid_ray(B, taus):
-    d = B.shape[1]
-    assert d == 3
-    directions = [np.array([i,j,20-i-j])/20 for i in range(21) for j in range(21-i)]
-    directions.append(np.ones(d)/d)
-    best = None
-    for u in directions:
-        intercept, slope = B.sum(axis=1), B @ u
-        path = []
-        for tau in taus:
-            positive = slope > 1e-12
-            a = np.min((intercept[positive] - 1/tau)/slope[positive])
-            path.append(a*u)
-        path = np.array(path)
-        if (path.min() < -TOL or path.max() > 1-EPS+TOL or
-                min(np.min(B @ (1-r)) for r in path) < 1-TOL):
-            continue
-        value = float(np.sum(path**2))
-        if best is None or value < best['fun']:
-            best = {'x': path, 'fun': value, 'direction': u}
-    if best is None:
-        raise RuntimeError('No feasible grid ray')
-    return best
+        stage_matrices, stage_limits = zip(
+            *[
+                build_stage_constraints(weighted_vertices, target, index)
+                for target, index in zip(targets, vertex_indices)
+            ]
+        )
+        matrix = np.vstack([block_diag(*stage_matrices), monotone_constraints])
+        limits = np.concatenate([*stage_limits, monotone_limits])
+        branch_solutions = [stage_branches[t][index] for t, index in enumerate(vertex_indices)]
+        start = np.concatenate(
+            [solution.reductions for solution in branch_solutions if solution is not None]
+        )
+        solution = solve_convex_qp(weights, matrix, limits, start)
+        if solution is not None and solution.objective < best_objective:
+            best_objective = solution.objective
+            best_path = solution.reductions.reshape(stage_count, input_count)
+
+    return best_path
