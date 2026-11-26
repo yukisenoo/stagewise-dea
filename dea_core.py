@@ -7,7 +7,7 @@ from itertools import combinations, islice, product
 
 import clarabel
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 from scipy import sparse
 from scipy.linalg import block_diag
 from scipy.optimize import linprog, minimize, nnls
@@ -70,23 +70,40 @@ def enumerate_dual_vertices(input_per_output: FloatArray) -> FloatArray:
     return np.array([vertices[key] for key in sorted(vertices)])
 
 
-def efficiency_primal(X, Y, x, y):
-    """Input-oriented CCR LP, independent of enumerated dual vertices."""
-    X, Y = np.asarray(X), np.asarray(Y)
-    if Y.ndim == 1:
-        Y = Y[:, None]
-    y = np.atleast_1d(y)
-    sx, sy = X.max(axis=0), Y.max(axis=0)
-    Xs, Ys, xs, ys = X / sx, Y / sy, x / sx, y / sy
-    n, d = X.shape
-    G = np.vstack([np.column_stack([-xs, Xs.T]),
-                   np.column_stack([np.zeros(Y.shape[1]), -Ys.T])])
-    b = np.r_[np.zeros(d), -ys]
-    sol = linprog(np.r_[1., np.zeros(n)], A_ub=G, b_ub=b,
-                  bounds=(0, None), method='highs')
-    if not sol.success:
-        raise RuntimeError(sol.message)
-    return float(sol.fun)
+def efficiency_primal(
+    reference_inputs: ArrayLike,
+    reference_outputs: ArrayLike,
+    target_inputs: ArrayLike,
+    target_outputs: ArrayLike,
+) -> float:
+    """Compute the input-oriented CCR efficiency using the primal linear program."""
+    inputs = np.asarray(reference_inputs)
+    outputs = np.asarray(reference_outputs)
+    if outputs.ndim == 1:
+        outputs = outputs[:, None]
+
+    input_scale = inputs.max(axis=0)
+    output_scale = outputs.max(axis=0)
+    scaled_inputs = inputs / input_scale
+    scaled_outputs = outputs / output_scale
+    scaled_target_inputs = np.asarray(target_inputs) / input_scale
+    scaled_target_outputs = np.atleast_1d(target_outputs) / output_scale
+
+    reference_count, input_count = inputs.shape
+    output_count = outputs.shape[1]
+    # The first variable is the common input multiplier. The rest weight reference units.
+    input_constraints = np.column_stack([-scaled_target_inputs, scaled_inputs.T])
+    output_constraints = np.column_stack([np.zeros(output_count), -scaled_outputs.T])
+    result = linprog(
+        np.r_[1.0, np.zeros(reference_count)],
+        A_ub=np.vstack([input_constraints, output_constraints]),
+        b_ub=np.r_[np.zeros(input_count), -scaled_target_outputs],
+        bounds=(0, None),
+        method="highs",
+    )
+    if not result.success:
+        raise RuntimeError(result.message)
+    return float(result.fun)
 
 
 def dual_objective_lower_bound(
@@ -243,32 +260,33 @@ def radial_path(initial_efficiency: float, targets: FloatArray, input_count: int
 
 def solve_single_stage(
     weighted_vertices: FloatArray, target: float
-) -> tuple[FloatArray, list[QuadraticSolution | None]]:
-    """Return the best reduction for one target and the solution for each vertex branch."""
+) -> tuple[FloatArray, dict[int, QuadraticSolution]]:
+    """Return the best reduction for one target and the feasible vertex branches."""
     initial_efficiency = 1.0 / weighted_vertices.sum(axis=1).min()
     input_count = weighted_vertices.shape[1]
     start = np.full(input_count, 1.0 - initial_efficiency / target)
     weights = np.eye(input_count)
-    branches = []
+    feasible_branches: dict[int, QuadraticSolution] = {}
     for branch_index in range(len(weighted_vertices)):
         matrix, limits = build_stage_constraints(weighted_vertices, target, branch_index)
-        branches.append(solve_convex_qp(weights, matrix, limits, start))
+        solution = solve_convex_qp(weights, matrix, limits, start)
+        if solution is not None:
+            feasible_branches[branch_index] = solution
 
-    feasible = [solution for solution in branches if solution is not None]
-    if not feasible:
+    if not feasible_branches:
         raise RuntimeError(f"No feasible improvement branch for target {target:.6f}.")
-    best = min(feasible, key=lambda solution: solution.objective)
-    return best.reductions, branches
+    best = min(feasible_branches.values(), key=lambda solution: solution.objective)
+    return best.reductions, feasible_branches
 
 
 def solve_monotone_path(
     weighted_vertices: FloatArray,
     targets: FloatArray,
-    stage_branches: list[list[QuadraticSolution | None]],
+    stage_branches: list[dict[int, QuadraticSolution]],
 ) -> FloatArray:
     """Solve all stages with nondecreasing reductions by pruning vertex combinations."""
     stage_count = len(targets)
-    vertex_count, input_count = weighted_vertices.shape
+    input_count = weighted_vertices.shape[1]
     variable_count = stage_count * input_count
     initial_efficiency = 1.0 / weighted_vertices.sum(axis=1).min()
     best_path = radial_path(initial_efficiency, targets, input_count)
@@ -283,12 +301,10 @@ def solve_monotone_path(
         monotone_constraints[current, following] = -identity
 
     ranked: list[tuple[float, tuple[int, ...]]] = []
-    for vertex_indices in product(range(vertex_count), repeat=stage_count):
-        branch_solutions = [stage_branches[t][index] for t, index in enumerate(vertex_indices)]
-        if any(solution is None for solution in branch_solutions):
-            continue
-        feasible = [solution for solution in branch_solutions if solution is not None]
-        lower_bound = sum(solution.lower_bound for solution in feasible)
+    for vertex_indices in product(*stage_branches):
+        lower_bound = sum(
+            branches[index].lower_bound for branches, index in zip(stage_branches, vertex_indices)
+        )
         ranked.append((lower_bound, vertex_indices))
     ranked.sort()
 
@@ -306,9 +322,8 @@ def solve_monotone_path(
         )
         matrix = np.vstack([block_diag(*stage_matrices), monotone_constraints])
         limits = np.concatenate([*stage_limits, monotone_limits])
-        branch_solutions = [stage_branches[t][index] for t, index in enumerate(vertex_indices)]
         start = np.concatenate(
-            [solution.reductions for solution in branch_solutions if solution is not None]
+            [branches[index].reductions for branches, index in zip(stage_branches, vertex_indices)]
         )
         solution = solve_convex_qp(weights, matrix, limits, start)
         if solution is not None and solution.objective < best_objective:
