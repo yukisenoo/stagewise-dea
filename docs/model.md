@@ -31,3 +31,35 @@ $$
 ## 計算規模の限界
 
 入力が $d$ 項目、事業体が $n$ 件の場合、頂点列挙では最大 $\binom{n+d}{d}$ 通りの制約の組み合わせを調べます。頂点数が $H$、段階数が $T$ のとき、段階をつなぐ候補は枝刈り前で最大 $H^T$ 通りです。実装の主な検証範囲は3入力・1出力・3段階です。
+
+## 1事業体の計画を再現する
+
+[実行方法](../README.md#実行方法)に沿って依存パッケージと `milkProd.csv.gz` を用意し、リポジトリのルートで以下を実行します。全108事業体から比較基準を作り、READMEに載せた事業体80だけの計画を求めます。出力される配列は行が段階、列がエネルギー支出・獣医費・乳牛頭数の順です。
+
+```python
+import numpy as np
+import pandas as pd
+
+from dea_core import efficiency_primal, enumerate_dual_vertices
+from run_dea_experiment import INPUT_COLUMNS, TARGET_FRACTIONS, improvement_paths
+
+data = pd.read_csv("milkProd.csv.gz", sep=";")
+row = data.index[data["farmNo"] == 80].item()
+inputs = data[INPUT_COLUMNS].to_numpy(dtype=float)
+outputs = data["milk"].to_numpy(dtype=float)
+
+ratios = inputs / outputs[:, None]
+initial_efficiency = efficiency_primal(inputs, outputs, inputs[row], outputs[row])
+targets = initial_efficiency + TARGET_FRACTIONS * (1.0 - initial_efficiency)
+weighted_vertices = enumerate_dual_vertices(ratios) * ratios[row]
+paths = improvement_paths(weighted_vertices, initial_efficiency, targets)
+
+print("初期効率", round(initial_efficiency, 4))
+print("目標効率", np.round(targets, 4))
+for method in ("Independent", "Nested"):
+    reductions = paths[method]
+    # 丸め誤差による負のゼロを避けて表示する。
+    percentages = 100 * np.maximum(reductions, 0.0)
+    print(method, np.round(percentages, 2))
+    print(f"J = {np.square(reductions).sum():.5f}")
+```
